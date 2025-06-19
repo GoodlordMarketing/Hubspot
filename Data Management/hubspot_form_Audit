@@ -1,0 +1,247 @@
+import requests
+import json
+import os
+import time
+
+# --- Configuration Management ---
+
+CONFIG_FILE = 'config.json'
+
+def create_config():
+    """
+    Prompts the user for their HubSpot API key and saves it to a config file.
+    """
+    print("--- HubSpot Configuration Setup ---")
+    print("For the API key, it's recommended to use a Private App access token.")
+    
+    api_key = input("Enter your HubSpot API Key (or Private App Token): ").strip()
+    
+    config_data = {
+        'api_key': api_key
+    }
+    
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config_data, f, indent=4)
+        print(f"\nConfiguration saved successfully to {CONFIG_FILE}")
+        return config_data
+    except IOError as e:
+        print(f"\nError: Could not write to config file {CONFIG_FILE}. - {e}")
+        return None
+
+def load_or_create_config():
+    """
+    Checks for an existing config file. If found, asks the user if they want to load it.
+    If not found or the user declines, it initiates the config creation process.
+    """
+    if os.path.exists(CONFIG_FILE):
+        while True:
+            choice = input(f"Configuration file '{CONFIG_FILE}' found. Load it? (y/n): ").lower().strip()
+            if choice in ['y', 'yes']:
+                try:
+                    with open(CONFIG_FILE, 'r') as f:
+                        config_data = json.load(f)
+                    print("Configuration loaded.")
+                    return config_data
+                except (IOError, json.JSONDecodeError) as e:
+                    print(f"Error loading config file: {e}. Please create a new one.")
+                    return create_config()
+            elif choice in ['n', 'no']:
+                print("A new configuration will be created.")
+                return create_config()
+            else:
+                print("Invalid input. Please enter 'y' or 'n'.")
+    else:
+        print("No configuration file found.")
+        return create_config()
+
+# --- HubSpot API Interaction (v3) ---
+
+def get_all_forms(api_key):
+    """
+    Fetches all forms from HubSpot using the v3 API, handling pagination.
+    """
+    print("\nFetching all forms from HubSpot (using v3 API)...")
+    all_forms = []
+    url = "https://api.hubapi.com/marketing/v3/forms"
+    headers = {'Authorization': f'Bearer {api_key}'}
+    
+    try:
+        while url:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            all_forms.extend(data.get('results', []))
+            url = data.get('paging', {}).get('next', {}).get('link')
+            if url:
+                print(f"  Fetching next page...")
+                time.sleep(0.4)
+        print(f"Successfully retrieved {len(all_forms)} forms.")
+        return all_forms
+    except requests.exceptions.RequestException as e:
+        print(f"\n--- ERROR FETCHING FORMS ---")
+        print(f"An error occurred: {e}")
+        if e.response is not None:
+            print(f"  - HTTP Status Code: {e.response.status_code}")
+            print(f"  - HubSpot Error Response: {e.response.text}")
+            if e.response.status_code == 401:
+                print("  - Troubleshooting: A 401 Unauthorized error means your API key is invalid or expired. Please create a new config file with a valid key.")
+            elif e.response.status_code == 403:
+                print("  - Troubleshooting: A 403 Forbidden error means your API key does not have the required permissions (scopes) to read forms. Please check your Private App settings in HubSpot to ensure it has 'forms' read access.")
+        return []
+
+def get_form_by_id(form_id, api_key):
+    """
+    Fetches a single form by its ID using the v3 API.
+    """
+    print(f"\nFetching form with ID: {form_id}...")
+    url = f"https://api.hubapi.com/marketing/v3/forms/{form_id}"
+    headers = {'Authorization': f'Bearer {api_key}'}
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"\n--- ERROR FETCHING FORM {form_id} ---")
+        print(f"An error occurred: {e}")
+        if e.response is not None:
+            print(f"  - HTTP Status Code: {e.response.status_code}")
+            print(f"  - HubSpot Error Response: {e.response.text}")
+            if e.response.status_code == 404:
+                print(f"  - Troubleshooting: A 404 Not Found error means the form ID '{form_id}' does not exist in your HubSpot account.")
+        return None
+
+def update_form(form_id, api_key):
+    """
+    Updates a specific form in HubSpot using a PATCH request (v3 API).
+    This sends only the fields that need to be changed.
+    """
+    url = f"https://api.hubapi.com/marketing/v3/forms/{form_id}"
+    headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+    
+    # Use the field name 'createNewContactForNewEmail' for the update payload,
+    # as confirmed by user testing. Also disable pre-population to avoid conflicts.
+    payload = {
+        "configuration": {
+            "createNewContactForNewEmail": True,
+            "prePopulateKnownValues": False
+        }
+    }
+    
+    try:
+        response = requests.patch(url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()
+        time.sleep(0.4)
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"\n--- ERROR UPDATING FORM {form_id} ---")
+        print(f"An error occurred: {e}")
+        if e.response is not None:
+            print(f"  - HTTP Status Code: {e.response.status_code}")
+            print(f"  - HubSpot Error Response: {e.response.text}")
+            if e.response.status_code == 403:
+                print("  - Troubleshooting: A 403 Forbidden error means your API key does not have the required permissions (scopes) to write/edit forms. Please check your Private App settings in HubSpot to ensure it has 'forms' write access.")
+            elif e.response.status_code == 400:
+                print("  - Troubleshooting: A 400 Bad Request error often means the data sent to HubSpot was invalid. The response above from HubSpot may contain more details.")
+        return False
+
+# --- Main Logic ---
+
+def process_forms(forms_to_process, api_key):
+    """
+    Filters forms that need updating and then performs the update.
+    """
+    forms_to_modify = []
+    
+    print("\nChecking forms to see if 'Create New Contact' is enabled...")
+    for form in forms_to_process:
+        # CORRECTED: Check for 'createNewContactForNewEmail' to match the update logic.
+        if not form.get('configuration', {}).get('createNewContactForNewEmail', False):
+            print(f"  - Form '{form.get('name')}' (ID: {form.get('id')}) needs to be updated.")
+            forms_to_modify.append(form)
+            
+    if not forms_to_modify:
+        print("\nAll processed forms already have the 'Create New Contact' option enabled.")
+        return []
+
+    print(f"\nFound {len(forms_to_modify)} forms to modify.")
+    
+    confirm = input("Do you want to proceed with modifying these forms? (y/n): ").lower().strip()
+    if confirm not in ['y', 'yes']:
+        print("Modification cancelled by user.")
+        return []
+
+    modified_forms_names = []
+    print("\nStarting modification process...")
+    for form_data in forms_to_modify:
+        form_id = form_data.get('id')
+        form_name = form_data.get('name')
+        print(f"  - Modifying '{form_name}'...")
+        if update_form(form_id, api_key):
+            print(f"  - Successfully updated '{form_name}'.")
+            modified_forms_names.append(form_name)
+        else:
+            print(f"  - FAILED to update '{form_name}'. Please review the error message above for details.")
+    
+    return modified_forms_names
+
+def main():
+    """Main function to run the script."""
+    print("=================================================")
+    print("=      HubSpot Form Updater Script (v3 API)     =")
+    print("=================================================")
+    
+    try:
+        config = load_or_create_config()
+        if not config:
+            print("\nExiting due to configuration error.")
+            return
+            
+        api_key = config.get('api_key')
+
+        if not api_key:
+            print("\nAPI Key is missing from the configuration. Please re-run the script to set it up.")
+            return
+            
+        while True:
+            test_mode = input("\nRun in test mode for a single form? (y/n): ").lower().strip()
+            if test_mode in ['y', 'yes', 'n', 'no']:
+                break
+            else:
+                print("Invalid input. Please enter 'y' or 'n'.")
+
+        forms_to_check = []
+        if test_mode in ['y', 'yes']:
+            form_id_to_test = input("Enter the Form ID you want to test: ").strip()
+            single_form = get_form_by_id(form_id_to_test, api_key)
+            if single_form:
+                forms_to_check.append(single_form)
+        else:
+            all_forms = get_all_forms(api_key)
+            if all_forms:
+                forms_to_check = all_forms
+
+        if not forms_to_check:
+            print("\nNo forms to process. This could be due to an error during fetching or because no forms were found.")
+            return
+
+        modified_names = process_forms(forms_to_check, api_key)
+        
+        if modified_names:
+            print("\n--- Operation Complete ---")
+            print("The following forms were successfully modified:")
+            for name in modified_names:
+                print(f"- {name}")
+        else:
+            print("\n--- Operation Complete ---")
+            print("No forms were modified.")
+
+    except Exception as e:
+        print("\n--- A FATAL UNEXPECTED ERROR OCCURRED ---")
+        print("The script stopped due to an unhandled issue.")
+        print(f"Error details: {e}")
+        print("\nPlease copy this entire error message when asking for help.")
+
+if __name__ == '__main__':
+    main()
